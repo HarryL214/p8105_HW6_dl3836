@@ -1,0 +1,245 @@
+---
+title: "P8105 Homework 6"
+author: "Di Lian (dl3836)"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Problem 1
+
+```{r packages-p1}
+library(tidyverse)
+library(broom)
+```
+
+### Data cleaning
+
+```{r clean-homicide}
+homicide_df <- 
+  read_csv("data/homicide-data.csv") %>%
+  mutate(
+    city_state = str_c(city, state, sep = ", "),
+    resolved = case_when(
+      disposition == "Closed by arrest" ~ 1,
+      TRUE ~ 0
+    ),
+    victim_age = as.numeric(victim_age)
+  ) %>%
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("White", "Black")
+  )
+```
+
+### Baltimore-specific model
+
+```{r baltimore-glm}
+baltimore_fit <- homicide_df %>%
+  filter(city_state == "Baltimore, MD") %>%
+  glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial, data = .)
+
+baltimore_or <- baltimore_fit %>%
+  tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term == "victim_sexMale") %>%
+  select(term, estimate, conf.low, conf.high)
+
+baltimore_or
+```
+
+### City-specific models
+
+```{r city-models}
+city_results <- homicide_df %>%
+  nest(data = -city_state) %>%
+  mutate(
+    models = map(data, ~ glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial, data = .x)),
+    tidied = map(models, tidy, conf.int = TRUE, exponentiate = TRUE)
+  ) %>%
+  select(city_state, tidied) %>%
+  unnest(tidied) %>%
+  filter(term == "victim_sexMale") %>%
+  mutate(city_state = fct_reorder(city_state, estimate))
+```
+
+```{r city-plot, fig.height=8, fig.width=7}
+city_results %>%
+  ggplot(aes(x = city_state, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(
+    x = "City",
+    y = "Adjusted OR (Male vs Female)",
+    title = "Adjusted odds ratios for homicide resolution by city"
+  )
+```
+
+The odds ratios vary widely by city; several cities show higher resolution odds for cases with male victims, while a few cities have estimates near or below 1, indicating similar or lower resolution odds compared with female victims. Uncertainty is substantial for smaller cities, as reflected by wide intervals.
+
+## Problem 2
+
+```{r packages-p2}
+library(p8105.datasets)
+library(modelr)
+```
+
+```{r load-weather}
+data("weather_df")
+```
+
+### Bootstrap sampling
+
+```{r bootstrap}
+set.seed(1234)
+
+boot_straps <- weather_df %>%
+  bootstrap(5000, id = "strap")
+
+boot_results <- boot_straps %>%
+  mutate(
+    models = map(strap, ~ lm(tmax ~ tmin + prcp, data = as_tibble(.x))),
+    glance = map(models, glance),
+    tidy = map(models, tidy)
+  ) %>%
+  mutate(
+    r_squared = map_dbl(glance, "r.squared"),
+    beta_product = map_dbl(tidy, ~ {
+      coefs <- .x %>% select(term, estimate)
+      beta1 <- coefs %>% filter(term == "tmin") %>% pull(estimate)
+      beta2 <- coefs %>% filter(term == "prcp") %>% pull(estimate)
+      beta1 * beta2
+    })
+  ) %>%
+  select(r_squared, beta_product)
+```
+
+### Distribution plots
+
+```{r bootstrap-plots, fig.height=4.5, fig.width=9}
+boot_results_long <- boot_results %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "estimate")
+
+boot_results_long %>%
+  ggplot(aes(x = estimate, fill = metric)) +
+  geom_histogram(alpha = 0.7, bins = 30, color = "white") +
+  facet_wrap(~ metric, scales = "free") +
+  labs(
+    x = "Estimate",
+    y = "Count",
+    title = "Bootstrap distributions for R-squared and beta product"
+  ) +
+  theme(legend.position = "none")
+```
+
+### Interval estimates
+
+```{r bootstrap-intervals}
+boot_results_long %>%
+  group_by(metric) %>%
+  summarize(
+    ci_lower = quantile(estimate, 0.025),
+    ci_upper = quantile(estimate, 0.975)
+  )
+```
+
+The bootstrap distribution of $\hat r^2$ is approximately symmetric and centered near the observed value, indicating stable model fit. The distribution of $\hat\beta_1 \hat\beta_2$ is skewed and concentrated near zero, reflecting the weak interaction of temperature and precipitation effects. The percentile intervals quantify uncertainty for both quantities.
+
+## Problem 3
+
+```{r packages-p3}
+library(ggplot2)
+library(modelr)
+```
+
+### Data cleaning
+
+```{r clean-birthweight}
+birthweight_df <- read_csv("data/birthweight.csv") %>%
+  mutate(
+    babysex = factor(babysex, levels = c(1, 2), labels = c("male", "female")),
+    frace = factor(frace),
+    mrace = factor(mrace),
+    malform = factor(malform),
+    frace = fct_recode(frace, "White" = "1", "Black" = "2", "Asian" = "3", "Puerto Rican" = "4", "Other" = "8", "Unknown" = "9"),
+    mrace = fct_recode(mrace, "White" = "1", "Black" = "2", "Asian" = "3", "Puerto Rican" = "4", "Other" = "8")
+  )
+
+birthweight_df %>%
+  summarize(total_missing = sum(is.na(.)))
+```
+
+No missing values are present in the dataset.
+
+### Proposed model
+
+I built a model focused on infant size and maternal health factors, hypothesizing that gestational development and maternal characteristics drive birthweight. The model includes baby head circumference and length, gestational age, maternal age, pre-pregnancy BMI, weight gain during pregnancy, smoking, and family income:
+
+```{r proposed-model}
+model_main <- lm(bwt ~ bhead + blength + gaweeks + ppbmi + wtgain + momage + smoken + fincome, data = birthweight_df)
+
+tidy(model_main)
+```
+
+### Residual diagnostics
+
+```{r residuals-plot, fig.height=4.5, fig.width=7}
+resid_plot_df <- birthweight_df %>%
+  add_predictions(model_main) %>%
+  add_residuals(model_main)
+
+resid_plot_df %>%
+  ggplot(aes(x = pred, y = resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    x = "Fitted values",
+    y = "Residuals",
+    title = "Residuals vs fitted values for proposed birthweight model"
+  )
+```
+
+### Model comparison
+
+```{r comparison}
+set.seed(1234)
+
+cv_df <- crossv_mc(birthweight_df, n = 100)
+
+cv_results <- cv_df %>%
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble),
+    fit_main = map(train, ~ lm(bwt ~ bhead + blength + gaweeks + ppbmi + wtgain + momage + smoken + fincome, data = .x)),
+    fit_simple = map(train, ~ lm(bwt ~ blength + gaweeks, data = .x)),
+    fit_interaction = map(train, ~ lm(bwt ~ bhead * blength * babysex, data = .x)),
+    rmse_main = map2_dbl(fit_main, test, ~ rmse(model = .x, data = .y)),
+    rmse_simple = map2_dbl(fit_simple, test, ~ rmse(model = .x, data = .y)),
+    rmse_interaction = map2_dbl(fit_interaction, test, ~ rmse(model = .x, data = .y))
+  )
+
+cv_results %>%
+  select(starts_with("rmse")) %>%
+  pivot_longer(everything(), names_to = "model", values_to = "rmse") %>%
+  mutate(model = recode(model,
+                        rmse_main = "Proposed model",
+                        rmse_simple = "Length + gestational age",
+                        rmse_interaction = "Head + length + sex (interactions)")) %>%
+  ggplot(aes(x = model, y = rmse)) +
+  geom_boxplot() +
+  labs(
+    x = "Model",
+    y = "RMSE",
+    title = "Cross-validated RMSE across models"
+  ) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+The proposed model shows lower cross-validated RMSE than the simpler gestational-age model and performs comparably to or slightly better than the fully interactive head/length/sex model, suggesting it balances predictive accuracy with parsimony.
