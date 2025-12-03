@@ -1,4 +1,4 @@
----
+ ---
 title: "P8105 Homework 6"
 author: "Di Lian (dl3836)"
 output: github_document
@@ -85,72 +85,61 @@ city_results %>%
 The odds ratios vary widely by city; several cities show higher resolution odds for cases with male victims, while a few cities have estimates near or below 1, indicating similar or lower resolution odds compared with female victims. Uncertainty is substantial for smaller cities, as reflected by wide intervals.
 
 ## Problem 2
-
-```{r packages-p2}
+```{r}
+library(tidyverse)
+library(broom)
 library(p8105.datasets)
-library(modelr)
-```
 
-```{r load-weather}
+set.seed(123)
+
+n_boot <- 5000
+
+# Load data
 data("weather_df")
-```
 
-### Bootstrap sampling
+# Generate bootstrap estimates for R^2 and beta1*beta2
+boot_estimates <- map_dfr(1:n_boot, function(i) {
+  boot_sample <- sample_frac(weather_df, size = 1, replace = TRUE)
+  fit <- lm(tmax ~ tmin + prcp, data = boot_sample)
+  glance_df <- glance(fit)
+  tidy_df <- tidy(fit)
 
-```{r bootstrap}
-set.seed(1234)
+  beta1 <- tidy_df %>% filter(term == "tmin") %>% pull(estimate)
+  beta2 <- tidy_df %>% filter(term == "prcp") %>% pull(estimate)
 
-boot_straps <- weather_df %>%
-  bootstrap(5000, id = "strap")
-
-boot_results <- boot_straps %>%
-  mutate(
-    models = map(strap, ~ lm(tmax ~ tmin + prcp, data = .x)),
-    glance = map(models, glance),
-    tidy = map(models, tidy)
-  ) %>%
-  mutate(
-    r_squared = map_dbl(glance, "r.squared"),
-    beta_product = map_dbl(tidy, ~ {
-      coefs <- .x %>% select(term, estimate)
-      beta1 <- coefs %>% filter(term == "tmin") %>% pull(estimate)
-      beta2 <- coefs %>% filter(term == "prcp") %>% pull(estimate)
-      beta1 * beta2
-    })
-  ) %>%
-  select(r_squared, beta_product)
-```
-
-### Distribution plots
-
-```{r bootstrap-plots, fig.height=4.5, fig.width=9}
-boot_results_long <- boot_results %>%
-  pivot_longer(everything(), names_to = "metric", values_to = "estimate")
-
-boot_results_long %>%
-  ggplot(aes(x = estimate, fill = metric)) +
-  geom_histogram(alpha = 0.7, bins = 30, color = "white") +
-  facet_wrap(~ metric, scales = "free") +
-  labs(
-    x = "Estimate",
-    y = "Count",
-    title = "Bootstrap distributions for R-squared and beta product"
-  ) +
-  theme(legend.position = "none")
-```
-
-### Interval estimates
-
-```{r bootstrap-intervals}
-boot_results_long %>%
-  group_by(metric) %>%
-  summarize(
-    ci_lower = quantile(estimate, 0.025),
-    ci_upper = quantile(estimate, 0.975)
+  tibble(
+    r_squared = glance_df$r.squared,
+    beta1_beta2 = beta1 * beta2
   )
+})
+
+# Calculate confidence intervals
+ci_summary <- tibble(
+  measure = c("R_squared", "beta1_beta2"),
+  lower = c(quantile(boot_estimates$r_squared, 0.025),
+            quantile(boot_estimates$beta1_beta2, 0.025)),
+  upper = c(quantile(boot_estimates$r_squared, 0.975),
+            quantile(boot_estimates$beta1_beta2, 0.975))
+)
+
+print(ci_summary)
+
+# Plot distributions
+estimate_plot <- boot_estimates %>%
+  pivot_longer(cols = everything(), names_to = "measure", values_to = "value") %>%
+  mutate(measure = recode(measure,
+                          r_squared = "R-squared",
+                          beta1_beta2 = "beta1 * beta2")) %>%
+  ggplot(aes(x = value)) +
+  geom_density(fill = "#2c7fb8", alpha = 0.6, color = NA) +
+  facet_wrap(~measure, scales = "free") +
+  labs(title = "Bootstrap distributions for Central Park weather regression",
+       x = "Estimate", y = "Density") +
+  theme_minimal()
+
+ggsave("bootstrap_estimates.png", estimate_plot, width = 8, height = 4, dpi = 300)
 ```
 
-The bootstrap distribution of $\hat r^2$ is approximately symmetric and centered near the observed value, indicating stable model fit. The distribution of $\hat\beta_1 \hat\beta_2$ is skewed and concentrated near zero, reflecting the weak interaction of temperature and precipitation effects. The percentile intervals quantify uncertainty for both quantities.
 
 ## Problem 3
 
